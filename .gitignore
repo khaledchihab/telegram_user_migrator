@@ -1,0 +1,26 @@
+# Pyrogram session files
+*.session
+
+# Migration reports
+migration_reports/
+migration_report_*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
