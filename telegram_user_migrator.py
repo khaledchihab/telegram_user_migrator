@@ -6,6 +6,28 @@ import time
 from datetime import datetime
 import os
 import json
+import argparse
+import logging
+from typing import Optional, Tuple, List
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('migration.log', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class MigrationError(Exception):
+    """Base exception for migration errors"""
+    pass
+
+class GroupValidationError(MigrationError):
+    """Raised when group validation fails"""
+    pass
 
 class TelegramMigrator:
     def __init__(self, api_id: str, api_hash: str, session_name: str = "user_migration"):
@@ -21,20 +43,28 @@ class TelegramMigrator:
             "errors": {}
         }
         self.start_time = None
+        self.dry_run = False
 
     async def start(self):
         """Initialize and start the Pyrogram client"""
-        self.client = Client(self.session_name, api_id=self.api_id, api_hash=self.api_hash)
-        await self.client.start()
-        me = await self.client.get_me()
-        print(f"\nConnected as: {me.first_name} ({me.id})")
-        
+        try:
+            self.client = Client(self.session_name, api_id=self.api_id, api_hash=self.api_hash)
+            await self.client.start()
+            me = await self.client.get_me()
+            logger.info(f"\nConnected as: {me.first_name} ({me.id})")
+        except Exception as e:
+            logger.error(f"Failed to start client: {e}")
+            raise MigrationError(f"Failed to start client: {e}")
+
     async def stop(self):
         """Stop the Pyrogram client"""
         if self.client:
-            await self.client.stop()
+            try:
+                await self.client.stop()
+            except Exception as e:
+                logger.error(f"Error stopping client: {e}")
 
-    async def validate_group(self, chat_id: str) -> tuple:
+    async def validate_group(self, chat_id: str) -> Tuple[Optional[any], bool]:
         """Validate group and return chat info"""
         try:
             # If input starts with '@', it's a username
@@ -45,39 +75,41 @@ class TelegramMigrator:
             elif chat_id.startswith('-100'):
                 chat = await self.client.get_chat(int(chat_id))
             elif chat_id.isdigit():
-                # Convert to proper group ID format
                 formatted_id = int(f"-100{chat_id}")
                 chat = await self.client.get_chat(formatted_id)
             else:
-                # Try direct ID first, then with -100 prefix
                 try:
                     chat = await self.client.get_chat(int(chat_id))
                 except:
                     formatted_id = int(f"-100{chat_id.replace('-', '')}")
                     chat = await self.client.get_chat(formatted_id)
             
-            print(f"\nGroup Info:")
-            print(f"Title: {chat.title}")
-            print(f"ID: {chat.id}")
+            logger.info(f"\nGroup Info:")
+            logger.info(f"Title: {chat.title}")
+            logger.info(f"ID: {chat.id}")
             if chat.username:
-                print(f"Username: @{chat.username}")
+                logger.info(f"Username: @{chat.username}")
             else:
-                print("This is a private group")
+                logger.info("This is a private group")
+            
+            # Verify bot permissions
+            if not chat.permissions:
+                raise GroupValidationError("Bot doesn't have permission to view group members")
             
             return chat, True
             
-        except ValueError as e:
-            print(f"Error: Invalid group ID format. Please check the ID/username")
+        except GroupValidationError as e:
+            logger.error(f"Group validation error: {e}")
             return None, False
         except Exception as e:
-            print(f"Error accessing group: {str(e)}")
+            logger.error(f"Error accessing group: {e}")
             return None, False
 
-    async def get_chat_members(self, chat_id: str, filter_bots: bool = True):
+    async def get_chat_members(self, chat_id: str, filter_bots: bool = True) -> List[User]:
         """Get all members from a chat"""
         try:
             members = []
-            print("\nFetching members...")
+            logger.info("\nFetching members...")
             async for member in self.client.get_chat_members(chat_id):
                 if filter_bots and (member.user.is_bot or member.user.is_deleted):
                     self.stats["skipped"] += 1
@@ -85,33 +117,38 @@ class TelegramMigrator:
                 members.append(member)
             return members
         except Exception as e:
-            print(f"Error getting members: {e}")
+            logger.error(f"Error getting members: {e}")
             return []
 
     async def add_user(self, chat_id: str, user: User) -> bool:
-        """Add a user to a chat forcefully"""
+        """Add a user to a chat"""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would add user {user.first_name} ({user.id})")
+            return True
+
         try:
             await self.client.add_chat_members(chat_id, user.id)
-            print(f"✅ Successfully added user {user.first_name} ({user.id})")
+            logger.info(f"✅ Successfully added user {user.first_name} ({user.id})")
             return True
         except FloodWait as e:
-            print(f"⏳ Rate limit hit. Waiting {e.value} seconds...")
-            await asyncio.sleep(e.value)
+            wait_time = e.value
+            logger.warning(f"⏳ Rate limit hit. Waiting {wait_time} seconds...")
+            await asyncio.sleep(wait_time)
             return False
         except UserPrivacyRestricted:
-            print(f"🔒 Cannot add user {user.first_name} ({user.id}): Privacy settings restricted")
+            logger.warning(f"🔒 Cannot add user {user.first_name} ({user.id}): Privacy settings restricted")
             self._update_error_stats("Privacy Restricted")
             return False
         except UserNotMutualContact:
-            print(f"👥 Cannot add user {user.first_name} ({user.id}): Not a mutual contact")
+            logger.warning(f"👥 Cannot add user {user.first_name} ({user.id}): Not a mutual contact")
             self._update_error_stats("Not Mutual Contact")
             return False
         except PeerIdInvalid:
-            print(f"❌ Cannot add user {user.first_name} ({user.id}): Invalid user")
+            logger.warning(f"❌ Cannot add user {user.first_name} ({user.id}): Invalid user")
             self._update_error_stats("Invalid User")
             return False
         except Exception as e:
-            print(f"❌ Error adding user {user.first_name} ({user.id}): {e}")
+            logger.error(f"❌ Error adding user {user.first_name} ({user.id}): {e}")
             self._update_error_stats(str(e))
             return False
 
@@ -205,116 +242,95 @@ class TelegramMigrator:
             else:
                 f.write(f"- {report['errors_breakdown']}\n")
         
-        print(f"\nDetailed reports saved to:")
-        print(f"- JSON format: {json_filename}")
-        print(f"- Text format: {text_filename}")
+        logger.info(f"\nDetailed reports saved to:")
+        logger.info(f"- JSON format: {json_filename}")
+        logger.info(f"- Text format: {text_filename}")
 
 async def main():
-    print("\n=== Telegram User Migration Tool ===\n")
-    
-    # Get credentials
-    api_id = input("Enter your API ID: ").strip()
-    api_hash = input("Enter your API Hash: ").strip()
+    parser = argparse.ArgumentParser(description='Telegram User Migration Tool')
+    parser.add_argument('-a', '--api-id', help='API ID', required=True)
+    parser.add_argument('-H', '--api-hash', help='API Hash', required=True)
+    parser.add_argument('-s', '--source-group', help='Source group ID/username', required=True)
+    parser.add_argument('-t', '--target-group', help='Target group ID/username', required=True)
+    parser.add_argument('-d', '--dry-run', action='store_true', help='Perform a dry run')
+    args = parser.parse_args()
+
+    logger.info("\n=== Telegram User Migration Tool ===\n")
     
     # Initialize migrator
-    migrator = TelegramMigrator(api_id, api_hash)
+    migrator = TelegramMigrator(args.api_id, args.api_hash)
+    migrator.dry_run = args.dry_run
     
     try:
         # Start the client
         await migrator.start()
         
-        while True:
-            # Get source group
-            source_group = input("\nEnter the source group ID/username: ").strip()
-            print("\nValidating source group...")
-            source_chat, source_valid = await migrator.validate_group(source_group)
+        # Validate source and target groups
+        logger.info("\nValidating source group...")
+        source_chat, source_valid = await migrator.validate_group(args.source_group)
+        if not source_valid:
+            logger.error("❌ Invalid source group. Please check the ID/username and try again.")
+            return
+        
+        logger.info("\nValidating target group...")
+        target_chat, target_valid = await migrator.validate_group(args.target_group)
+        if not target_valid:
+            logger.error("❌ Invalid target group. Please check the ID/username and try again.")
+            return
+        
+        # Both groups are valid, proceed
+        logger.info(f"\nSource group validated: {source_chat.title}")
+        logger.info(f"Target group validated: {target_chat.title}")
+        
+        # Start migration process
+        migrator.start_time = time.time()
+        logger.info("\nFetching members from source group...")
+        members = await migrator.get_chat_members(args.source_group)
+        
+        if not members:
+            logger.error("No members found or error occurred! Try again or press Ctrl+C to exit.")
+            return
+        
+        total_members = len(members)
+        migrator.stats["total"] = total_members
+        logger.info(f"\nFound {total_members} members")
+        
+        # Move members
+        logger.info("\nStarting migration...")
+        for i, member in enumerate(members, 1):
+            logger.info(f"\nProcessing {i}/{total_members}")
             
-            if not source_valid:
-                print("❌ Invalid source group. Please check the ID/username and try again.")
-                continue
-                
-            print(f"✅ Source group validated: {source_chat.title}")
+            if await migrator.add_user(args.target_group, member.user):
+                migrator.stats["success"] += 1
+            else:
+                migrator.stats["failed"] += 1
             
-            # Get target group
-            target_group = input("\nEnter the destination group ID/username: ").strip()
-            print("\nValidating target group...")
-            target_chat, target_valid = await migrator.validate_group(target_group)
+            # Progress percentage
+            progress = (i / total_members) * 100
+            logger.info(f"Progress: {progress:.1f}%")
             
-            if not target_valid:
-                print("❌ Invalid target group. Please check the ID/username and try again.")
-                continue
-            
-            print(f"✅ Target group validated: {target_chat.title}")
-            
-            # Both groups are valid, proceed
-            confirm = input("\nProceed with migration? (y/n): ").strip().lower()
-            if confirm != 'y':
-                print("Migration cancelled. Enter new groups or press Ctrl+C to exit.")
-                continue
-            
-            # Start migration process
-            migrator.start_time = time.time()
-            print("\nFetching members from source group...")
-            members = await migrator.get_chat_members(source_group)
-            
-            if not members:
-                print("No members found or error occurred! Try again or press Ctrl+C to exit.")
-                continue
-            
-            total_members = len(members)
-            migrator.stats["total"] = total_members
-            print(f"\nFound {total_members} members")
-            
-            # Move members
-            print("\nStarting migration...")
-            for i, member in enumerate(members, 1):
-                print(f"\nProcessing {i}/{total_members}")
-                
-                if await migrator.add_user(target_group, member.user):
-                    migrator.stats["success"] += 1
-                else:
-                    migrator.stats["failed"] += 1
-                
-                # Progress percentage
-                progress = (i / total_members) * 100
-                print(f"Progress: {progress:.1f}%")
-                
-                # Small delay to avoid hitting rate limits too frequently
-                await asyncio.sleep(2)
-            
-            # Print and save results
-            print(f"\nMigration completed!")
-            print(f"Total processed: {migrator.stats['total']}")
-            print(f"Successfully moved: {migrator.stats['success']}")
-            print(f"Failed to move: {migrator.stats['failed']}")
-            print(f"Skipped (bots/deleted): {migrator.stats['skipped']}")
-            
-            if migrator.stats["errors"]:
-                print("\nError breakdown:")
-                for error_type, count in migrator.stats["errors"].items():
-                    print(f"- {error_type}: {count}")
-            
-            migrator.save_migration_report(source_chat, target_chat)
-            
-            # Ask if user wants to do another migration
-            another = input("\nWould you like to do another migration? (y/n): ").strip().lower()
-            if another != 'y':
-                break
-            
-            # Reset stats for new migration
-            migrator.stats = {
-                "total": 0,
-                "success": 0,
-                "failed": 0,
-                "skipped": 0,
-                "errors": {}
-            }
+            # Small delay to avoid hitting rate limits too frequently
+            await asyncio.sleep(2)
+        
+        # Print and save results
+        logger.info(f"\nMigration completed!")
+        logger.info(f"Total processed: {migrator.stats['total']}")
+        logger.info(f"Successfully moved: {migrator.stats['success']}")
+        logger.info(f"Failed to move: {migrator.stats['failed']}")
+        logger.info(f"Skipped (bots/deleted): {migrator.stats['skipped']}")
+        
+        if migrator.stats["errors"]:
+            logger.info("\nError breakdown:")
+            for error_type, count in migrator.stats["errors"].items():
+                logger.info(f"- {error_type}: {count}")
+        
+        migrator.save_migration_report(source_chat, target_chat)
     
     except KeyboardInterrupt:
-        print("\n\nScript interrupted by user.")
+        logger.info("\n\nScript interrupted by user.")
     except Exception as e:
-        print(f"\nAn error occurred: {e}")
-        print("You can try again or press Ctrl+C to exit.")
+        logger.error(f"\nAn error occurred: {e}")
+        logger.info("You can try again or press Ctrl+C to exit.")
     finally:
         # Always ensure we properly close the client
         await migrator.stop()

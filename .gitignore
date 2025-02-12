@@ -1,14 +1,18 @@
 # Pyrogram session files
 *.session
+*.session-journal
 
-# Migration reports
+# Migration reports and logs
 migration_reports/
 migration_report_*.json
+migration_report_*.txt
+*.log
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
 
 # Environment
 .env
@@ -20,7 +24,15 @@ ENV/
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
