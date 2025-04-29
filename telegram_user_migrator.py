@@ -1,7 +1,7 @@
 import asyncio
 from pyrogram import Client, errors, enums
 from pyrogram.types import User, Chat
-from pyrogram.errors import FloodWait, UserPrivacyRestricted, PeerIdInvalid, UserNotMutualContact, PeerFloodError
+from pyrogram.errors import FloodWait, UserPrivacyRestricted, PeerIdInvalid, UserNotMutualContact
 import time
 from datetime import datetime
 import os
@@ -9,6 +9,8 @@ import json
 import argparse
 import logging
 import sys
+import signal
+import pickle
 from typing import Optional, Tuple, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 try:
@@ -82,6 +84,9 @@ class TelegramMigrator:
         self.use_color = Colors.supports_color()
         self.current_permissions = {}  # Track permissions for different groups
         self.retry_attempts = 3  # Number of times to retry adding a user before giving up
+        self.progress_file = f"{session_name}_progress.pkl"
+        self.processed_users = set()  # Track IDs of processed users
+        self.should_exit = False  # Flag to indicate graceful exit
 
     async def start(self):
         """Initialize and start the Pyrogram client"""
@@ -300,14 +305,24 @@ class TelegramMigrator:
 
     async def add_user(self, chat_id: str, user: User) -> bool:
         """Add a user to a chat with enhanced error handling"""
+        # Skip if we've processed this user already
+        if user.id in self.processed_users:
+            self.log_info(f"Skipping already processed user {user.first_name} ({user.id})")
+            return True
+
         if self.dry_run:
             self.log_info(f"[DRY RUN] Would add user {user.first_name} ({user.id})")
+            self.processed_users.add(user.id)
             return True
 
         try:
             await self.client.add_chat_members(chat_id, user.id)
             full_name = f"{user.first_name} {user.last_name if user.last_name else ''}".strip()
             self.log_success(f"✅ Successfully added user {full_name} ({user.id})")
+            
+            # Mark as processed
+            self.processed_users.add(user.id)
+            self.save_progress()  # Save progress after each successful addition
             
             # Wait for the recommended time after each successful addition
             self.log_info(f"Waiting {INVITE_DELAY} seconds before next invite (Telegram recommendation)...")
@@ -317,53 +332,67 @@ class TelegramMigrator:
         except FloodWait as e:
             wait_time = e.value
             self.log_warning(f"⏳ Rate limit hit. Waiting {wait_time} seconds...")
-            await asyncio.sleep(wait_time)
-            return False
-        except PeerFloodError:
-            self.log_warning(f"🚫 Peer flood error. Waiting {FLOOD_ERROR_DELAY // 60} minutes...")
-            self._update_error_stats("Peer Flood Error")
-            await asyncio.sleep(FLOOD_ERROR_DELAY)
-            return False
+            self.save_progress()  # Save progress before waiting
+            
+            try:
+                await asyncio.sleep(wait_time)
+                return False
+            except asyncio.CancelledError:
+                self.log_warning("Wait interrupted, progress saved")
+                raise
+            
         except UserPrivacyRestricted:
             self.log_warning(f"🔒 Cannot add {user.first_name} ({user.id}): Privacy settings restricted")
             self._update_error_stats("Privacy Restricted")
+            self.processed_users.add(user.id)  # Still mark as processed to avoid retrying
             return False
         except UserNotMutualContact:
             self.log_warning(f"👥 Cannot add {user.first_name} ({user.id}): Not a mutual contact")
             self._update_error_stats("Not Mutual Contact")
+            self.processed_users.add(user.id)
             return False
         except PeerIdInvalid:
             self.log_warning(f"❌ Cannot add {user.first_name} ({user.id}): Invalid user")
             self._update_error_stats("Invalid User")
+            self.processed_users.add(user.id)
             return False
         except errors.ChatAdminRequired:
             self.log_warning(f"⚠️ Cannot add users: Admin privileges required")
             self._update_error_stats("Admin Privileges Required")
+            self.processed_users.add(user.id)
             return False
         except errors.UserChannelsTooMuch:
             self.log_warning(f"🔄 User {user.first_name} is in too many channels already")
             self._update_error_stats("User In Too Many Channels")
-            return False
-        except errors.UserNotMutualContact:
-            self.log_warning(f"👤 Cannot add {user.first_name}: User not in mutual contact")
-            self._update_error_stats("Not Mutual Contact")
-            return False
-        except errors.UserPrivacyRestricted:
-            self.log_warning(f"🔐 Cannot add {user.first_name}: Privacy settings restricted")
-            self._update_error_stats("Privacy Restricted")
+            self.processed_users.add(user.id)
             return False
         except errors.InputUserDeactivated:
             self.log_warning(f"🚷 Cannot add {user.first_name}: User account deleted/deactivated")
             self._update_error_stats("User Deactivated")
+            self.processed_users.add(user.id)
             return False
         except errors.ChannelPrivate:
             self.log_error(f"🔒 Cannot access target group: It's private and you're not a member")
             self._update_error_stats("Channel Private")
+            self.processed_users.add(user.id)
             return False
         except Exception as e:
-            self.log_error(f"❌ Error adding {user.first_name} ({user.id}): {e}")
-            self._update_error_stats(str(e))
-            return False
+            if "PEER_FLOOD" in str(e) or "FLOOD_WAIT" in str(e) or "flood" in str(e).lower():
+                self.log_warning(f"🚫 Peer flood error. Waiting {FLOOD_ERROR_DELAY // 60} minutes...")
+                self._update_error_stats("Peer Flood Error")
+                self.save_progress()  # Save progress before long wait
+                
+                try:
+                    await asyncio.sleep(FLOOD_ERROR_DELAY)
+                    return False
+                except asyncio.CancelledError:
+                    self.log_warning("Flood wait interrupted, progress saved")
+                    raise
+            else:
+                self.log_error(f"❌ Error adding {user.first_name} ({user.id}): {e}")
+                self._update_error_stats(str(e))
+                self.processed_users.add(user.id)  # Mark as processed to avoid infinite retries
+                return False
 
     async def batch_add_users(self, chat_id: str, users: List[User], batch_size: int = 5, delay: int = 30) -> None:
         """Add users in batches to minimize flood wait errors"""
@@ -371,27 +400,56 @@ class TelegramMigrator:
             return
             
         self.log_info(f"Processing users in batches of {batch_size}")
+        
+        # Filter out already processed users if resuming
+        if self.processed_users:
+            users = [u for u in users if u.user.id not in self.processed_users]
+            self.log_info(f"Skipping {len(self.processed_users)} already processed users")
+            if not users:
+                self.log_success("All users have been processed already!")
+                return
+        
         user_chunks = [users[i:i+batch_size] for i in range(0, len(users), batch_size)]
         
         for i, chunk in enumerate(user_chunks, 1):
+            # Check if we should exit gracefully
+            if self.should_exit:
+                self.log_warning("Exiting after current batch due to interrupt")
+                return
+                
             self.log_info(f"Processing batch {i}/{len(user_chunks)} ({len(chunk)} users)")
             
             # Process each user in the batch
             batch_success = 0
             for user in chunk:
-                if await self.add_user(chat_id, user.user):
-                    self.stats["success"] += 1
-                    batch_success += 1
-                else:
-                    self.stats["failed"] += 1
+                try:
+                    if await self.add_user(chat_id, user.user):
+                        self.stats["success"] += 1
+                        batch_success += 1
+                    else:
+                        self.stats["failed"] += 1
+                except asyncio.CancelledError:
+                    self.save_progress()
+                    self.log_warning("Operation interrupted, progress saved")
+                    raise
+                    
+                # Check for exit signal
+                if self.should_exit:
+                    self.log_warning("Exiting due to interrupt")
+                    return
             
             # Log batch results
             self.log_info(f"Batch {i} complete: {batch_success}/{len(chunk)} successful")
+            self.save_progress()  # Save progress after each batch
             
             # Only wait between batches if it's not the last batch
-            if i < len(user_chunks):
+            if i < len(user_chunks) and not self.should_exit:
                 self.log_info(f"Waiting {delay} seconds before next batch...")
-                await asyncio.sleep(delay)
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    self.save_progress()
+                    raise
 
     def _update_error_stats(self, error_type: str):
         """Update error statistics"""
@@ -581,13 +639,14 @@ class TelegramMigrator:
                     self.log_warning(f"Message rate limit hit. Waiting {e.value} seconds...")
                     await asyncio.sleep(e.value)
                     failed_count += 1
-                except PeerFloodError:
-                    self.log_warning(f"Messaging too many users. Taking a long break...")
-                    await asyncio.sleep(300)  # 5 minute delay
-                    failed_count += 1
                 except Exception as e:
-                    self.log_warning(f"Failed to message user {user.user.id}: {e}")
-                    failed_count += 1
+                    if "FLOOD_WAIT" in str(e) or "flood" in str(e).lower():
+                        self.log_warning(f"🚫 Peer flood error. Waiting {FLOOD_ERROR_DELAY // 60} minutes...")
+                        await asyncio.sleep(FLOOD_ERROR_DELAY)
+                        failed_count += 1
+                    else:
+                        self.log_warning(f"Failed to message user {user.user.id}: {e}")
+                        failed_count += 1
             
             self.log_success(f"Sent invite link to {sent_count} users ({failed_count} failed)")
             return invite_link, sent_count
@@ -680,6 +739,65 @@ class TelegramMigrator:
         except Exception as e:
             self.log_error(f"Error analyzing target group: {e}")
             return {"error": str(e)}
+
+    def save_progress(self):
+        """Save current progress to a file for resuming later"""
+        try:
+            progress_data = {
+                "processed_users": self.processed_users,
+                "stats": self.stats,
+                "timestamp": time.time()
+            }
+            with open(self.progress_file, 'wb') as f:
+                pickle.dump(progress_data, f)
+            self.log_info(f"Progress saved to {self.progress_file}")
+        except Exception as e:
+            self.log_error(f"Failed to save progress: {e}")
+
+    def load_progress(self) -> bool:
+        """Load progress from file if it exists"""
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'rb') as f:
+                    progress_data = pickle.load(f)
+                
+                self.processed_users = progress_data.get("processed_users", set())
+                self.stats = progress_data.get("stats", self.stats)
+                
+                timestamp = progress_data.get("timestamp", 0)
+                time_ago = time.time() - timestamp
+                hours, remainder = divmod(time_ago, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                
+                timestr = ""
+                if hours > 0:
+                    timestr += f"{int(hours)}h "
+                if minutes > 0 or hours > 0:
+                    timestr += f"{int(minutes)}m "
+                timestr += f"{int(seconds)}s"
+                
+                self.log_success(f"Loaded previous progress from {timestr} ago")
+                self.log_info(f"Previously processed {len(self.processed_users)} users")
+                return True
+            except Exception as e:
+                self.log_error(f"Failed to load progress file: {e}")
+                return False
+        return False
+
+    def register_signal_handlers(self):
+        """Register signal handlers for graceful exit"""
+        if os.name == 'posix':  # Unix/Linux/macOS
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        else:  # Windows doesn't handle signals the same way
+            # We'll rely on asyncio's exception handling for KeyboardInterrupt
+            pass
+
+    def _signal_handler(self, signum, frame):
+        """Signal handler for graceful exit"""
+        self.should_exit = True
+        self.log_warning(f"Received signal {signum}, will exit after current operation completes")
+        self.save_progress()
 
 class MultiAccountMigrator:
     def __init__(self, accounts: List[Dict[str, Any]]):
@@ -943,7 +1061,7 @@ class MultiAccountMigrator:
                 last_error = error_types[-1] if error_types else "Unknown"
                 
                 if last_error == "Peer Flood Error":
-                    # Set long cooldown for this account
+                    # Set long cooldown for ONLY this account
                     self.log_warning(f"Account {account_idx+1} hit flood protection, placing in 1-hour cooldown")
                     self._set_account_cooldown(account_idx, FLOOD_ERROR_DELAY)
                     
@@ -971,7 +1089,7 @@ class MultiAccountMigrator:
             # Penalize this account for unexpected errors
             self._update_account_performance(account_idx, False)
             return await self.add_user_with_fallback(chat_id, user, exclude_idx=account_idx)
-            
+
     async def add_user_with_fallback(self, chat_id: str, user: User, exclude_idx: int = None) -> bool:
         """Try to add user with any account except the excluded one"""
         attempts = 0
@@ -1009,3 +1127,328 @@ class MultiAccountMigrator:
             attempts += 1
             
         return False
+
+async def main():
+    """Main entry point for the script."""
+    parser = argparse.ArgumentParser(
+        description="Migrate users from one Telegram group to another",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    
+    # Core arguments
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-a", "--api-id", help="Telegram API ID")
+    group.add_argument("-m", "--multi-account", help="Path to accounts.json file with multiple accounts")
+    
+    parser.add_argument("-H", "--api-hash", help="Telegram API hash (not required with --multi-account)")
+    parser.add_argument("-s", "--source", required=True, help="Source group username or ID")
+    parser.add_argument("-t", "--target", required=True, help="Target group username or ID")
+    parser.add_argument("-n", "--session-name", default="user_migration", 
+                        help="Session name (default: user_migration)")
+    
+    # Optional features
+    parser.add_argument("--dry-run", action="store_true", 
+                        help="Perform a dry run without actually adding users")
+    parser.add_argument("--batch-size", type=int, default=5, 
+                        help="Number of users to process in a batch (default: 5)")
+    parser.add_argument("--batch-delay", type=int, default=30, 
+                        help="Delay between batches in seconds (default: 30)")
+    parser.add_argument("--limit", type=int, default=0, 
+                        help="Limit the number of users to migrate (0=unlimited)")
+    parser.add_argument("--filter", choices=["active", "all", "recent"], default="active", 
+                        help="Filter users: active (exclude deleted/bots), all, recent (default: active)")
+    parser.add_argument("--invite-link", action="store_true",
+                        help="Use invite link approach instead of direct additions")
+    parser.add_argument("--expire-hours", type=int, default=24, 
+                        help="Invite link expiration in hours (default: 24)")
+    parser.add_argument("--no-retry", action="store_true", 
+                        help="Don't retry failed additions")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Don't resume from previous progress")
+    parser.add_argument("--force-clear", action="store_true",
+                        help="Clear any saved progress before starting")
+    
+    args = parser.parse_args()
+    
+    # Check if we're using multiple accounts
+    multi_account_mode = args.multi_account is not None
+    
+    if multi_account_mode:
+        # Load multiple account credentials
+        try:
+            with open(args.multi_account, 'r') as f:
+                accounts = json.load(f)
+            if not accounts:
+                print("Error: No accounts found in the provided JSON file")
+                return
+        except Exception as e:
+            print(f"Error loading accounts file: {e}")
+            print("Please make sure the file exists and contains valid JSON")
+            return
+            
+        # Initialize multi-account migrator
+        migrator = MultiAccountMigrator(accounts)
+        
+        # Set dry run mode if specified
+        if args.dry_run:
+            migrator.dry_run = True
+            migrator.log_info("DRY RUN MODE: No actual changes will be made")
+            
+        # Start the migration process with multiple accounts
+        migrator.start_time = time.time()
+        
+        try:
+            # Start all accounts
+            if not await migrator.start_all():
+                return
+                
+            # Validate source and target groups
+            source_chat, source_valid = await migrator.validate_group(args.source)
+            if not source_valid:
+                migrator.log_error(f"Invalid source group: {args.source}")
+                return
+                
+            target_chat, target_valid = await migrator.validate_group(args.target)
+            if not target_valid:
+                migrator.log_error(f"Invalid target group: {args.target}")
+                return
+                
+            # Check permissions for all accounts
+            await migrator.check_all_permissions(args.target)
+            
+            # Get members from source group
+            filter_bots = args.filter == "active"
+            members = await migrator.get_chat_members(args.source, filter_bots=filter_bots, limit=args.limit)
+            
+            if not members:
+                migrator.log_warning("No members found in source group or couldn't retrieve members")
+                return
+                
+            migrator.stats["total"] = len(members)
+            
+            # Process members directly (multi-account mode doesn't support invite links yet)
+            migrator.log_info(f"\n📥 Using multiple accounts for direct addition")
+            
+            # Split members among accounts and process
+            for i, member in enumerate(members):
+                if await migrator.add_user(args.target, member.user):
+                    migrator.stats["success"] += 1
+                else:
+                    migrator.stats["failed"] += 1
+                    
+                # Print progress every 10 users
+                if i > 0 and i % 10 == 0:
+                    success_rate = (migrator.stats["success"] / i) * 100
+                    migrator.log_info(f"Progress: {i}/{len(members)} users processed ({success_rate:.2f}% success rate)")
+            
+            # Print final statistics
+            success_rate = (migrator.stats["success"] / migrator.stats["total"]) * 100 if migrator.stats["total"] > 0 else 0
+            
+            migrator.log_info("\n📊 Migration Summary:")
+            migrator.log_info(f"• Total users processed: {migrator.stats['total']}")
+            migrator.log_success(f"• Successfully migrated: {migrator.stats['success']}")
+            migrator.log_warning(f"• Failed to migrate: {migrator.stats['failed']}")
+            migrator.log_info(f"• Skipped users: {migrator.stats['skipped']}")
+            migrator.log_info(f"• Success rate: {success_rate:.2f}%")
+            
+            duration = time.time() - migrator.start_time
+            hours, remainder = divmod(duration, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            duration_formatted = ""
+            if hours > 0:
+                duration_formatted += f"{int(hours)}h "
+            if minutes > 0 or hours > 0:
+                duration_formatted += f"{int(minutes)}m "
+            duration_formatted += f"{int(seconds)}s"
+            
+            migrator.log_info(f"• Total time: {duration_formatted}")
+            
+        except KeyboardInterrupt:
+            migrator.log_warning("\nOperation interrupted by user")
+            migrator.log_info("Progress saved. Run the same command to resume.")
+        except Exception as e:
+            migrator.log_error(f"Error during migration: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Disconnect all accounts
+            await migrator.stop_all()
+            
+    else:
+        # Original single-account mode
+        # Validate required arguments for single account mode
+        if not args.api_id or not args.api_hash:
+            print("Error: API ID and API hash are required for single account mode")
+            return
+            
+        # Initialize migrator for single account
+        migrator = TelegramMigrator(args.api_id, args.api_hash, args.session_name)
+        
+        # Register signal handlers for graceful shutdown
+        migrator.register_signal_handlers()
+        
+        if args.dry_run:
+            migrator.dry_run = True
+            migrator.log_info("DRY RUN MODE: No actual changes will be made")
+        
+        # Handle progress management
+        if args.force_clear and os.path.exists(migrator.progress_file):
+            os.remove(migrator.progress_file)
+            migrator.log_info("Cleared previous progress data")
+        
+        # Attempt to resume unless explicitly told not to
+        resuming = False
+        if not args.no_resume:
+            resuming = migrator.load_progress()
+        
+        try:
+            # Start timer (unless resuming)
+            if not resuming:
+                migrator.start_time = time.time()
+            else:
+                # When resuming, we don't reset the timer completely, but we don't want
+                # to count the time the script was not running
+                current_time = time.time()
+                # Estimate elapsed time based on processed users
+                if migrator.stats["total"] > 0:
+                    # Rough estimate: if X users took Y time, then total would be (Y/X) * total
+                    migrator.start_time = current_time - (current_time - migrator.start_time if hasattr(migrator, 'start_time') else 0)
+                else:
+                    migrator.start_time = current_time
+            
+            # Connect to Telegram
+            await migrator.start()
+            
+            # Validate source group
+            source_chat, source_valid = await migrator.validate_group(args.source)
+            if not source_valid:
+                migrator.log_error(f"Invalid source group: {args.source}")
+                return
+                
+            # Validate target group
+            target_chat, target_valid = await migrator.validate_group(args.target)
+            if not target_valid:
+                migrator.log_error(f"Invalid target group: {args.target}")
+                return
+            
+            # Get members from source group if not resuming or not enough users processed
+            if not resuming or len(migrator.processed_users) == 0:
+                filter_bots = args.filter == "active"
+                members = await migrator.get_chat_members(args.source, filter_bots=filter_bots, limit=args.limit)
+                
+                if not members:
+                    migrator.log_warning("No members found in source group or couldn't retrieve members")
+                    return
+                
+                migrator.stats["total"] = len(members)
+            else:
+                # When resuming, we'll use the loaded progress data and fetch members only for filtering
+                members = await migrator.get_chat_members(args.source, filter_bots=(args.filter == "active"), limit=args.limit)
+                migrator.log_info(f"Resuming with {len(members)} total members, {len(migrator.processed_users)} already processed")
+            
+            # Analyze target group for recommendations
+            analysis = await migrator.analyze_target_group(args.target)
+            
+            # Show recommendations and warnings
+            if "recommendations" in analysis and analysis["recommendations"]:
+                migrator.log_info("\n🔍 Recommendations:")
+                for rec in analysis["recommendations"]:
+                    migrator.log_info(f"• {rec}")
+                    
+            if "warnings" in analysis and analysis["warnings"]:
+                migrator.log_warning("\n⚠️ Warnings:")
+                for warn in analysis["warnings"]:
+                    migrator.log_warning(f"• {warn}")
+            
+            # Choose migration method based on arguments and capabilities
+            if args.invite_link:
+                # Use invite link approach
+                migrator.log_info("\n📤 Using invite link approach.")
+                invite_link, sent_count = await migrator.migrate_by_invite_link(
+                    args.target, 
+                    members,
+                    expire_hours=args.expire_hours
+                )
+                
+                if sent_count > 0:
+                    migrator.log_success(f"Successfully sent invite link to {sent_count} users")
+                else:
+                    migrator.log_warning("Failed to send invite links to users")
+            else:
+                # Use direct addition approach
+                migrator.log_info("\n📥 Using direct addition approach")
+                
+                # Process users in batches
+                await migrator.batch_add_users(
+                    args.target, 
+                    members, 
+                    batch_size=args.batch_size, 
+                    delay=args.batch_delay
+                )
+                
+                # Retry failed users if needed
+                if not args.no_retry and migrator.stats["failed"] > 0:
+                    # Get list of failed members that haven't been processed
+                    failed_members = [m for m in members if m.user.id not in migrator.processed_users]
+                    
+                    if failed_members:
+                        migrator.log_info(f"Retrying {len(failed_members)} failed users")
+                        await migrator.retry_failed_users(args.target, failed_members)
+            
+            # Generate and save report
+            migrator.save_migration_report(source_chat, target_chat)
+            
+            # Print final statistics
+            success_rate = (migrator.stats["success"] / migrator.stats["total"]) * 100 if migrator.stats["total"] > 0 else 0
+            
+            migrator.log_info("\n📊 Migration Summary:")
+            migrator.log_info(f"• Total users processed: {migrator.stats['total']}")
+            migrator.log_success(f"• Successfully migrated: {migrator.stats['success']}")
+            migrator.log_warning(f"• Failed to migrate: {migrator.stats['failed']}")
+            migrator.log_info(f"• Skipped users: {migrator.stats['skipped']}")
+            migrator.log_info(f"• Success rate: {success_rate:.2f}%")
+            
+            duration = time.time() - migrator.start_time
+            hours, remainder = divmod(duration, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            duration_formatted = ""
+            if hours > 0:
+                duration_formatted += f"{int(hours)}h "
+            if minutes > 0 or hours > 0:
+                duration_formatted += f"{int(minutes)}m "
+            duration_formatted += f"{int(seconds)}s"
+            
+            migrator.log_info(f"• Total time: {duration_formatted}")
+            
+            # Clean up progress file if completed successfully
+            if os.path.exists(migrator.progress_file):
+                try:
+                    os.remove(migrator.progress_file)
+                    migrator.log_info("Progress file removed (migration completed successfully)")
+                except:
+                    pass
+            
+        except KeyboardInterrupt:
+            migrator.log_warning("\nOperation interrupted by user")
+            migrator.save_progress()
+            migrator.log_info("Progress saved. Run the same command to resume.")
+        except Exception as e:
+            migrator.log_error(f"Error during migration: {e}")
+            migrator.save_progress()
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Disconnect
+            await migrator.stop()
+        
+# Add this at the very end of your file
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nOperation interrupted by user. Progress has been saved.")
+        print("Run the same command to resume from where you left off.")
+    except Exception as e:
+        print(f"Unhandled error: {e}")
+        import traceback
+        traceback.print_exc()

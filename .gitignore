@@ -2,6 +2,9 @@
 *.session
 *.session-journal
 
+# Progress files
+*_progress.pkl
+
 # Migration reports and logs
 migration_reports/
 migration_report_*.json
@@ -13,6 +16,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache/
+pytest_cache/
+.coverage
+coverage.xml
+*.cover
+htmlcov/
 
 # Environment
 .env
@@ -36,3 +45,16 @@ desktop.ini
 *.tmp
 *.bak
 *.backup
+
+# Configuration files with sensitive information
+# Keep the example but ignore actual configuration
+accounts.json
+!accounts.json.example
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Local development settings
+.python-version
