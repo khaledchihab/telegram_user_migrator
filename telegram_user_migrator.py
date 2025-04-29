@@ -454,8 +454,8 @@ class TelegramMigrator:
     def _update_error_stats(self, error_type: str):
         """Update error statistics"""
         if error_type not in self.stats["errors"]:
-            self.stats["errors"][error_type] = 0
-        self.stats["errors"][error_type] += 1
+            self.stats["errors"] = 0
+        self.stats["errors"] += 1
 
     def save_migration_report(self, source_chat, target_chat):
         """Save migration report to a file"""
@@ -819,6 +819,8 @@ class MultiAccountMigrator:
         self.account_cooldowns = {}  # Track which accounts are in cooldown
         self.account_performance = {} # Track success rate of each account
         self.permissions_cache = {}   # Cache permissions across accounts
+        self.processed_users = set()  # Track IDs of processed users
+        self.progress_file = "multi_account_progress.pkl"  # File to save progress
         
         # Create migrators for each account
         for i, account in enumerate(accounts):
@@ -930,8 +932,8 @@ class MultiAccountMigrator:
     def _update_error_stats(self, error_type: str):
         """Update error statistics"""
         if error_type not in self.stats["errors"]:
-            self.stats["errors"][error_type] = 0
-        self.stats["errors"][error_type] += 1
+            self.stats["errors"] = 0
+        self.stats["errors"] += 1
         
     def _update_account_performance(self, account_idx: int, success: bool):
         """Update account performance metrics"""
@@ -1128,6 +1130,69 @@ class MultiAccountMigrator:
             
         return False
 
+    async def parallel_add_users(self, chat_id: str, users: List[User], batch_size: int = 5) -> None:
+        """Add users in parallel using multiple accounts simultaneously"""
+        if not users:
+            return
+
+        self.log_info(f"Processing {len(users)} users in parallel with batch size of {batch_size}")
+
+        # Filter out already processed users if resuming
+        processed_users = set()  # Use a local variable instead of instance attribute
+        
+        # Split users into smaller chunks for parallel processing
+        total_accounts = len(self.active_migrators)
+        if total_accounts == 0:
+            self.log_error("No active accounts available for adding users")
+            return
+            
+        # Determine optimal chunk size based on available accounts
+        optimal_chunk_size = max(1, min(batch_size, len(users) // total_accounts))
+        self.log_info(f"Using {total_accounts} accounts with chunk size of {optimal_chunk_size}")
+        
+        # Split users into chunks
+        user_chunks = [users[i:i+optimal_chunk_size] for i in range(0, len(users), optimal_chunk_size)]
+        chunk_count = len(user_chunks)
+        
+        # Create a semaphore to limit concurrent tasks based on account count
+        semaphore = asyncio.Semaphore(total_accounts)
+        
+        async def process_chunk(chunk_idx, chunk):
+            async with semaphore:
+                self.log_info(f"Processing chunk {chunk_idx+1}/{chunk_count} with {len(chunk)} users")
+                for user in chunk:
+                    if user.user.id in processed_users:
+                        continue
+                        
+                    success = await self.add_user(chat_id, user.user)
+                    
+                    if success:
+                        self.stats["success"] += 1
+                        processed_users.add(user.user.id)
+                    else:
+                        self.stats["failed"] += 1
+                    
+                    # Print progress periodically
+                    if (self.stats["success"] + self.stats["failed"]) % 10 == 0:
+                        total_processed = self.stats["success"] + self.stats["failed"]
+                        progress_pct = (total_processed / len(users)) * 100
+                        self.log_info(f"Progress: {total_processed}/{len(users)} ({progress_pct:.1f}%) - Success: {self.stats['success']}, Failed: {self.stats['failed']}")
+
+        # Create a task for each chunk and run them concurrently
+        tasks = []
+        for i, chunk in enumerate(user_chunks):
+            # Add a small delay to stagger the start of tasks
+            await asyncio.sleep(0.5)
+            tasks.append(asyncio.create_task(process_chunk(i, chunk)))
+        
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+        
+        # Final stats
+        self.log_success(f"Completed parallel processing")
+        self.log_info(f"Successfully added: {self.stats['success']} users")
+        self.log_info(f"Failed to add: {self.stats['failed']} users")
+
 async def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
@@ -1226,20 +1291,11 @@ async def main():
                 
             migrator.stats["total"] = len(members)
             
-            # Process members directly (multi-account mode doesn't support invite links yet)
-            migrator.log_info(f"\n📥 Using multiple accounts for direct addition")
+            # Process members directly with parallel processing
+            migrator.log_info(f"\n📥 Using multiple accounts in parallel for direct addition")
             
-            # Split members among accounts and process
-            for i, member in enumerate(members):
-                if await migrator.add_user(args.target, member.user):
-                    migrator.stats["success"] += 1
-                else:
-                    migrator.stats["failed"] += 1
-                    
-                # Print progress every 10 users
-                if i > 0 and i % 10 == 0:
-                    success_rate = (migrator.stats["success"] / i) * 100
-                    migrator.log_info(f"Progress: {i}/{len(members)} users processed ({success_rate:.2f}% success rate)")
+            # Use parallel processing to add users with multiple accounts simultaneously
+            await migrator.parallel_add_users(args.target, members, batch_size=args.batch_size)
             
             # Print final statistics
             success_rate = (migrator.stats["success"] / migrator.stats["total"]) * 100 if migrator.stats["total"] > 0 else 0
